@@ -63,6 +63,17 @@ SINK_CALLS = {
     "fastapi.responses.PlainTextResponse",
 }
 
+SAFE_JSON_RESPONSES = {
+    "jsonify",
+    "flask.jsonify",
+    "JSONResponse",
+    "fastapi.responses.JSONResponse",
+    "ORJSONResponse",
+    "fastapi.responses.ORJSONResponse",
+    "UJSONResponse",
+    "fastapi.responses.UJSONResponse",
+}
+
 
 def analyze(code: str) -> List[Issue]:
     try:
@@ -171,6 +182,7 @@ class TaintAnalyzer(ast.NodeVisitor):
         self.tainted: Set[str] = set()
         self.sanitized: Set[str] = set()
         self.tainted_dict: DefaultDict[str, Set[str]] = DefaultDict(set)
+        self.attr_tainted: DefaultDict[str, Set[str]] = DefaultDict(set)
         self.sanitizer_funcs: Set[str] = set(KNOWN_SANITIZERS) | set(user_sanitizers)
         self.function_defs: Set[str] = _collect_function_defs(tree)
 
@@ -262,13 +274,14 @@ class TaintAnalyzer(ast.NodeVisitor):
     # ---------- helpers ----------
     def _assign_target(self, target: ast.AST, value_res: TaintResult, value_node: Optional[ast.AST] = None) -> None:
         if isinstance(target, ast.Name):
+            was_tainted = target.id in self.tainted
             if value_res.tainted:
                 self._mark_tainted(target.id, value_res.sources)
             elif value_res.sanitized:
                 self._mark_sanitized(target.id)
             else:
-                # If assigning a function object to a previously tainted var, keep taint (not a sanitizer)
-                if isinstance(value_node, ast.Name) and value_node.id in self.function_defs:
+                # If assigning a function-like name to a previously tainted var, keep taint (likely not sanitizer)
+                if was_tainted and isinstance(value_node, ast.Name) and value_node.id not in self.sanitizer_funcs:
                     return
                 self._clear_var(target.id)
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -289,6 +302,22 @@ class TaintAnalyzer(ast.NodeVisitor):
                     self.tainted_dict[base_name].discard(key)
                     if not self.tainted_dict[base_name]:
                         self.tainted_dict.pop(base_name, None)
+        elif isinstance(target, ast.Attribute):
+            base_name = target.value.id if isinstance(target.value, ast.Name) else None
+            attr = target.attr if isinstance(target, ast.Attribute) else None
+            if base_name and attr:
+                if value_res.tainted:
+                    self.attr_tainted[base_name].add(attr)
+                elif value_res.sanitized:
+                    if attr in self.attr_tainted.get(base_name, set()):
+                        self.attr_tainted[base_name].discard(attr)
+                        if not self.attr_tainted[base_name]:
+                            self.attr_tainted.pop(base_name, None)
+                else:
+                    if attr in self.attr_tainted.get(base_name, set()):
+                        self.attr_tainted[base_name].discard(attr)
+                        if not self.attr_tainted[base_name]:
+                            self.attr_tainted.pop(base_name, None)
         else:
             if value_res.tainted and isinstance(target, ast.Attribute):
                 name = _call_name(target)
@@ -324,6 +353,9 @@ class TaintAnalyzer(ast.NodeVisitor):
             chain = _call_name(node)
             if self._attribute_is_request_source(chain):
                 return TaintResult(tainted=True, sources={chain})
+            base_name = node.value.id if isinstance(node.value, ast.Name) else None
+            if base_name and node.attr in self.attr_tainted.get(base_name, set()):
+                return TaintResult(tainted=True, sources={f"{base_name}.{node.attr}"})
             base_res = self.expr_taint(node.value)
             if base_res.tainted:
                 return TaintResult(tainted=True, sources=base_res.sources or {chain})
@@ -400,6 +432,9 @@ class TaintAnalyzer(ast.NodeVisitor):
             src = name or "external-input"
             return TaintResult(tainted=True, sources={src})
 
+        if name in SAFE_JSON_RESPONSES:
+            return TaintResult(sanitized=True)
+
         if name in self.sanitizer_funcs:
             return TaintResult(sanitized=True)
 
@@ -415,6 +450,13 @@ class TaintAnalyzer(ast.NodeVisitor):
                 tainted_sources |= res.sources
         tainted = bool(tainted_sources)
         sanitized = not tainted and any(r.sanitized for r in arg_results)
+
+        # str.format / format_map on HTML-ish templates
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"format", "format_map"}:
+            if isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
+                if "<" in node.func.value.value and ">" in node.func.value.value:
+                    tainted = tainted or bool(tainted_sources)
+                    sanitized = False
 
         return TaintResult(tainted=tainted, sanitized=sanitized, sources=tainted_sources)
 
@@ -492,6 +534,8 @@ class TaintAnalyzer(ast.NodeVisitor):
             return
         lower_name = name.lower()
         is_response_like = lower_name.endswith("response") or lower_name.endswith("render") or name in SINK_CALLS
+        if name in SAFE_JSON_RESPONSES:
+            return
         if not is_response_like and name not in SINK_CALLS:
             return
         sources: Set[str] = set()
@@ -521,6 +565,10 @@ class TaintAnalyzer(ast.NodeVisitor):
             name = _call_name(node.func)
             if name in {"Markup", "markupsafe.Markup", "HTMLResponse", "fastapi.responses.HTMLResponse", "render_template_string"}:
                 return True
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"format", "format_map"}:
+                if isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
+                    if "<" in node.func.value.value and ">" in node.func.value.value:
+                        return True
         return False
 
     def _decorators_imply_endpoint(self, decorators: List[ast.expr]) -> bool:
