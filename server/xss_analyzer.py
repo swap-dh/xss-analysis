@@ -61,6 +61,7 @@ SINK_CALLS = {
     "fastapi.responses.HTMLResponse",
     "PlainTextResponse",
     "fastapi.responses.PlainTextResponse",
+    "execute",
 }
 
 SAFE_JSON_RESPONSES = {
@@ -255,6 +256,27 @@ class TaintAnalyzer(ast.NodeVisitor):
     def visit_Expr(self, node: ast.Expr) -> None:
         self.expr_taint(node.value)
 
+    def visit_If(self, node: ast.If) -> None:
+        # Evaluate condition to catch taint sources/sinks inside the test.
+        self.expr_taint(node.test)
+
+        pre_state = self._snapshot_state()
+
+        # then branch
+        self._restore_state(self._clone_state(pre_state))
+        for stmt in node.body:
+            self.visit(stmt)
+        then_state = self._snapshot_state()
+
+        # else branch (or fall-through when empty)
+        self._restore_state(self._clone_state(pre_state))
+        for stmt in node.orelse:
+            self.visit(stmt)
+        else_state = self._snapshot_state()
+
+        merged_state = self._merge_states([then_state, else_state])
+        self._restore_state(merged_state)
+
     def visit_Try(self, node: ast.Try) -> None:
         before_tainted = set(self.tainted)
         for stmt in node.body:
@@ -272,6 +294,103 @@ class TaintAnalyzer(ast.NodeVisitor):
             self.visit(stmt)
 
     # ---------- helpers ----------
+    def _snapshot_state(
+        self,
+    ) -> Tuple[
+        Set[str],
+        Set[str],
+        DefaultDict[str, Set[str]],
+        DefaultDict[str, Set[str]],
+    ]:
+        return (
+            set(self.tainted),
+            set(self.sanitized),
+            self._copy_defaultdict(self.tainted_dict),
+            self._copy_defaultdict(self.attr_tainted),
+        )
+
+    def _clone_state(
+        self,
+        state: Tuple[
+            Set[str],
+            Set[str],
+            DefaultDict[str, Set[str]],
+            DefaultDict[str, Set[str]],
+        ],
+    ) -> Tuple[
+        Set[str],
+        Set[str],
+        DefaultDict[str, Set[str]],
+        DefaultDict[str, Set[str]],
+    ]:
+        tainted, sanitized, tainted_dict, attr_tainted = state
+        return (
+            set(tainted),
+            set(sanitized),
+            self._copy_defaultdict(tainted_dict),
+            self._copy_defaultdict(attr_tainted),
+        )
+
+    def _restore_state(
+        self,
+        state: Tuple[
+            Set[str],
+            Set[str],
+            DefaultDict[str, Set[str]],
+            DefaultDict[str, Set[str]],
+        ],
+    ) -> None:
+        self.tainted, self.sanitized, self.tainted_dict, self.attr_tainted = state
+
+    def _merge_states(
+        self,
+        states: List[
+            Tuple[
+                Set[str],
+                Set[str],
+                DefaultDict[str, Set[str]],
+                DefaultDict[str, Set[str]],
+            ]
+        ],
+    ) -> Tuple[
+        Set[str],
+        Set[str],
+        DefaultDict[str, Set[str]],
+        DefaultDict[str, Set[str]],
+    ]:
+        if not states:
+            return (
+                set(),
+                set(),
+                DefaultDict(set),
+                DefaultDict(set),
+            )
+
+        tainted_union: Set[str] = set()
+        for state in states:
+            tainted_union |= state[0]
+
+        sanitized_intersection = set(states[0][1])
+        for state in states[1:]:
+            sanitized_intersection &= state[1]
+        sanitized_intersection -= tainted_union
+
+        tainted_dict: DefaultDict[str, Set[str]] = DefaultDict(set)
+        attr_tainted: DefaultDict[str, Set[str]] = DefaultDict(set)
+        for _, _, tdict, adict in states:
+            for key, values in tdict.items():
+                tainted_dict[key].update(values)
+            for key, values in adict.items():
+                attr_tainted[key].update(values)
+
+        return tainted_union, sanitized_intersection, tainted_dict, attr_tainted
+
+    def _copy_defaultdict(self, source: DefaultDict[str, Set[str]]) -> DefaultDict[str, Set[str]]:
+        copied: DefaultDict[str, Set[str]] = DefaultDict(set)
+        for key, values in source.items():
+            copied[key] = set(values)
+        return copied
+
     def _assign_target(self, target: ast.AST, value_res: TaintResult, value_node: Optional[ast.AST] = None) -> None:
         if isinstance(target, ast.Name):
             was_tainted = target.id in self.tainted
