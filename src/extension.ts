@@ -10,6 +10,8 @@ import {
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
+let caseTerminal: vscode.Terminal | undefined;
+let caseTerminalWriter: vscode.EventEmitter<string> | undefined;
 const lastReports = new Map<string, string>();
 const lastChangeAt = new Map<string, number>();
 
@@ -56,6 +58,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
   outputChannel = vscode.window.createOutputChannel("XSS LSP Issues");
   context.subscriptions.push(outputChannel);
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((terminal) => {
+      if (terminal === caseTerminal) {
+        caseTerminal = undefined;
+        if (caseTerminalWriter) {
+          caseTerminalWriter.dispose();
+          caseTerminalWriter = undefined;
+        }
+      }
+    })
+  );
   context.subscriptions.push(
     vscode.languages.onDidChangeDiagnostics((event) => {
       void reportXssDiagnostics(event.uris);
@@ -120,6 +133,7 @@ async function reportXssDiagnostics(uris: readonly vscode.Uri[]) {
   }
 
   let shown = false;
+  let terminalShown = false;
   for (const uri of uris) {
     const uriKey = uri.toString();
     const doc = await vscode.workspace.openTextDocument(uri);
@@ -142,12 +156,19 @@ async function reportXssDiagnostics(uris: readonly vscode.Uri[]) {
         outputChannel.show(true);
         shown = true;
       }
+      const { terminal, writer } = getCaseTerminal();
+      if (!terminalShown) {
+        terminal.show(true);
+        terminalShown = true;
+      }
       for (const c of cases) {
         const ok = caseHasIssue(diagnostics, c);
         const status = ok ? "성공" : "실패";
-        outputChannel.appendLine(
-          `### ${c.id}번 케이스 -> ${status} ${elapsedSec.toFixed(2)}s`
-        );
+        const line = `### ${c.id}번 케이스 -> ${status} ${elapsedSec.toFixed(
+          2
+        )}s`;
+        outputChannel.appendLine(line);
+        writer.fire(`${line}\r\n`);
       }
       continue;
     }
@@ -183,6 +204,28 @@ async function reportXssDiagnostics(uris: readonly vscode.Uri[]) {
       outputChannel.appendLine(lineText);
     }
   }
+}
+
+function getCaseTerminal(): {
+  terminal: vscode.Terminal;
+  writer: vscode.EventEmitter<string>;
+} {
+  if (caseTerminal && caseTerminalWriter) {
+    return { terminal: caseTerminal, writer: caseTerminalWriter };
+  }
+  const writeEmitter = new vscode.EventEmitter<string>();
+  const pty: vscode.Pseudoterminal = {
+    onDidWrite: writeEmitter.event,
+    open: () => {},
+    close: () => {},
+  };
+  const terminal = vscode.window.createTerminal({
+    name: "XSS LSP Cases",
+    pty,
+  });
+  caseTerminal = terminal;
+  caseTerminalWriter = writeEmitter;
+  return { terminal, writer: writeEmitter };
 }
 
 function extractCases(doc: vscode.TextDocument): CaseRange[] {
